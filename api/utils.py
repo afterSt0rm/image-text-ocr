@@ -4,13 +4,17 @@ import os
 from typing import List, Tuple
 
 import fitz  # PyMuPDF
-import requests
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 from PIL import Image
 
 load_dotenv()
 
-BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8081")
+# OpenAI client configuration
+client = AsyncOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY", "sk-no-key-required"),
+    base_url=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8081/v1"),
+)
 
 
 def bytes_to_base64(image_bytes: bytes, max_size: int = 1024) -> str:
@@ -94,13 +98,12 @@ def extract_text_and_images_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, List[b
     return results
 
 
-def send_chat_completion_request(
+async def send_chat_completion_request(
     instruction: str,
     images_base64: List[str] = None,
-    base_url: str = BASE_URL,
     system_prompt: str = None,
 ) -> str:
-    """Send a chat completion request to the VLM."""
+    """Send an async chat completion request using OpenAI client."""
     
     content = [{"type": "text", "text": instruction}]
     
@@ -123,16 +126,12 @@ def send_chat_completion_request(
     if system_prompt:
         messages.insert(0, {"role": "system", "content": system_prompt})
 
-    response = requests.post(
-        f"{base_url}/v1/chat/completions",
-        headers={"Content-Type": "application/json"},
-        json={
-            "messages": messages,
-        },
-        timeout=600  # Add timeout to prevent hanging connections
-    )
-
-    if not response.ok:
-        raise Exception(f"Server error: {response.status_code} - {response.text}")
-
-    return response.json()["choices"][0]["message"]["content"]
+    try:
+        response = await client.chat.completions.create(
+            model="Qwen3-VL-8B-Instruct-GGUF:Q4_K_M",  # Model name (can be overridden by server)
+            messages=messages,
+            timeout=600.0,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        raise Exception(f"OpenAI API request failed: {str(e)}")
