@@ -67,7 +67,7 @@ with st.sidebar:
             st.session_state.current_chat_id = chat_id
 
 # --- Main Interface ---
-st.title("Unstructured Text OCR")
+st.title("Image Text OCR")
 
 # Image Uploader
 uploaded_file = st.file_uploader(
