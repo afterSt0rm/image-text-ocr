@@ -108,8 +108,14 @@ if (
                     }
                     data = {"prompt": prompt}
 
+                    # Route to appropriate endpoint based on file type
+                    if current_chat["image"].type == "application/pdf":
+                        endpoint = f"{api_base_url}/ocr/pdf"
+                    else:
+                        endpoint = f"{api_base_url}/ocr/image"
+
                     response = requests.post(
-                        f"{api_base_url}/ocr", files=files, data=data
+                        endpoint, files=files, data=data
                     )
 
                     if response.status_code == 200:
