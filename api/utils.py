@@ -102,6 +102,7 @@ async def send_chat_completion_request(
     instruction: str,
     images_base64: List[str] = None,
     system_prompt: str = None,
+    response_format: dict = None,
 ) -> str:
     """Send an async chat completion request using OpenAI client."""
     
@@ -127,11 +128,18 @@ async def send_chat_completion_request(
         messages.insert(0, {"role": "system", "content": system_prompt})
 
     try:
-        response = await client.chat.completions.create(
-            model="Qwen3-VL-8B-Instruct-GGUF:Q4_K_M",  # Model name (can be overridden by server)
-            messages=messages,
-            timeout=600.0,
-        )
+        # Build request kwargs
+        request_kwargs = {
+            "model": "Qwen3-VL-8B-Instruct-GGUF:Q4_K_M",
+            "messages": messages,
+            "timeout": 600.0,
+        }
+        
+        # Add response_format if provided (for structured output)
+        if response_format:
+            request_kwargs["response_format"] = response_format
+        
+        response = await client.chat.completions.create(**request_kwargs)
         return response.choices[0].message.content
     except Exception as e:
         raise Exception(f"OpenAI API request failed: {str(e)}")
