@@ -12,6 +12,7 @@ DOCUMENT_TYPES = {
     "Image": "image",
     "PDF": "pdf",
     "National ID": "national_id",
+    "Offer Letter": "offer_letter",
 }
 
 # --- State Management ---
@@ -137,6 +138,9 @@ if (
                     elif doc_type_key == "image":
                         endpoint = f"{api_base_url}/ocr/image"
                         data = {"prompt": prompt}
+                    elif doc_type_key == "offer_letter":
+                        endpoint = f"{api_base_url}/ocr/offer_letter"
+                        data = {"prompt": prompt}
                     else:  # Auto detect
                         if current_chat["image"].type == "application/pdf":
                             endpoint = f"{api_base_url}/ocr/pdf"
@@ -150,7 +154,7 @@ if (
                         result = response.json()
 
                         # Handle different response formats
-                        if doc_type_key == "national_id":
+                        if doc_type_key in ["national_id", "offer_letter"]:
                             # Structured output - display as JSON
                             response_data = result.get("data", {})
                             st.json(response_data)
