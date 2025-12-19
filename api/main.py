@@ -1,16 +1,27 @@
+from datetime import datetime
+from pathlib import Path
+
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from pathlib import Path
-from datetime import datetime
 
-from api.models import OCRRequest, OCRResponse, NationalIDResponse, NationalIDData, NATIONAL_ID_JSON_SCHEMA
+from api.models import (
+    NationalIDData,
+    NationalIDResponse,
+    OCRRequest,
+    OCRResponse,
+)
 from api.utils import (
     bytes_to_base64,
     extract_text_and_images_from_pdf,
+    get_national_id_json_schema,
     send_chat_completion_request,
 )
 
 app = FastAPI(title="OCR API", description="API for OCR processing of images and PDFs")
+
+
+# Auto-generated JSON Schema for structured output
+NATIONAL_ID_JSON_SCHEMA = get_national_id_json_schema()
 
 
 # Helper function to save output
@@ -18,14 +29,14 @@ def save_output(content: str, prefix: str = "ocr") -> Path:
     """Save OCR output to markdown file and return the path."""
     output_dir = Path("outputs")
     output_dir.mkdir(exist_ok=True)
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{prefix}_output_{timestamp}.md"
     output_path = output_dir / filename
-    
+
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
-    
+
     print(f"✓ Saved output to: {output_path}")
     return output_path
 
@@ -47,9 +58,9 @@ async def ocr_image_endpoint(
     """
     try:
         contents = await file.read()
-        
+
         # Convert to base64
-        image_base64 = bytes_to_base64(contents, max_size=512)
+        image_base64 = bytes_to_base64(contents, max_size=1024)
 
         # Send request to VLM
         response_text = await send_chat_completion_request(
@@ -57,7 +68,7 @@ async def ocr_image_endpoint(
             images_base64=[image_base64],
             system_prompt=request_data.system_prompt,
         )
-        
+
         save_output(response_text, prefix="image")
 
         return OCRResponse(
@@ -82,22 +93,24 @@ async def ocr_pdf_endpoint(
     """
     try:
         contents = await file.read()
-        
+
         if file.content_type != "application/pdf":
-            raise HTTPException(status_code=400, detail="This endpoint only accepts PDF files")
-        
+            raise HTTPException(
+                status_code=400, detail="This endpoint only accepts PDF files"
+            )
+
         response_texts = []
-        
+
         # Extract Text + Embedded Images
         pages = extract_text_and_images_from_pdf(contents)
-        
+
         for i, (extracted_text, page_images) in enumerate(pages):
             images_base64 = []
             for img_bytes in page_images[:1]:
-                images_base64.append(bytes_to_base64(img_bytes, max_size=512))
+                images_base64.append(bytes_to_base64(img_bytes, max_size=1024))
 
             # Hybrid Prompt: Digital Text + Figures
-            hybrid_prompt = f"""Page {i+1} Content:
+            hybrid_prompt = f"""Page {i + 1} Content:
 ```
 {extracted_text[:4000]}
 ```
@@ -108,14 +121,14 @@ Please transcribe the full page content in Markdown.
 - Format code blocks and JSON strictly with correct syntax (```json, ```python).
 - Do not hallucinate content not present in the text or images.
 {request_data.prompt}"""
-            
+
             page_response = await send_chat_completion_request(
                 hybrid_prompt,
                 images_base64=images_base64,
                 system_prompt=request_data.system_prompt,
             )
-            response_texts.append(f"--- Page {i+1} ---\n{page_response}")
-        
+            response_texts.append(f"--- Page {i + 1} ---\n{page_response}")
+
         final_response = "\n\n".join(response_texts)
         save_output(final_response, prefix="pdf")
 
@@ -135,6 +148,7 @@ Please transcribe the full page content in Markdown.
 @app.post("/ocr/national_id", response_model=NationalIDResponse)
 async def ocr_national_id_endpoint(
     file: UploadFile = File(...),
+    prompt: str = Form("Extract all fields from this National ID card."),
 ):
     """
     OCR endpoint for National ID cards with structured output.
@@ -142,41 +156,33 @@ async def ocr_national_id_endpoint(
     """
     try:
         contents = await file.read()
-        
+
         # Convert to base64
-        image_base64 = bytes_to_base64(contents, max_size=512)
+        image_base64 = bytes_to_base64(contents, max_size=1024)
 
         system_prompt = """You are an OCR assistant specialized in extracting information from National ID cards.
 Extract all fields from the ID card image and return ONLY valid JSON matching the required schema.
-Do not include any explanations or additional text outside the JSON object."""
+Do not include any explanations or additional text outside the JSON object.
 
-        prompt = """Extract the following fields from this National ID card image:
-- nationality
-- sex (M or F)
-- surname (in original script)
-- given_name (in original script)
-- mother_name
-- father_name
-- date_of_birth (format: YYYY-MM-DD)
-- date_of_issue (format: DD-MM-YYYY)
-- national_id_number
-- signature (or "N/A" if not visible)
+CRITICAL: All dates must be converted to YYYY-MM-DD format regardless of how they appear in the document (e.g., DD-MM-YYYY or MM/DD/YY must be normalized to YYYY-MM-DD)."""
 
-Return ONLY the JSON object."""
+        # Use user's prompt or default
+        user_prompt = prompt
 
         # Send request with structured output
         response_text = await send_chat_completion_request(
-            prompt,
+            user_prompt,
             images_base64=[image_base64],
             system_prompt=system_prompt,
             response_format=NATIONAL_ID_JSON_SCHEMA,
         )
-        
+
         # Parse and validate response
         import json
+
         data = json.loads(response_text)
         validated_data = NationalIDData(**data)
-        
+
         # Save output
         save_output(response_text, prefix="national_id")
 
@@ -186,7 +192,9 @@ Return ONLY the JSON object."""
         )
 
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse structured output: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to parse structured output: {str(e)}"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
