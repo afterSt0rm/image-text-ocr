@@ -4,11 +4,13 @@ import os
 from typing import List, Tuple
 
 import fitz  # PyMuPDF
+import cv2
+import numpy as np
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from PIL import Image
 
-from api.models import NationalIDData
+from api.models import NationalIDData, OfferLetterData
 
 load_dotenv()
 
@@ -27,6 +29,18 @@ def get_national_id_json_schema() -> dict:
             "name": "national_id",
             "strict": True,
             "schema": NationalIDData.model_json_schema(),
+        },
+    }
+
+
+def get_offer_letter_json_schema() -> dict:
+    """Generate JSON schema for offer letter structured output."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "offer_letter",
+            "strict": True,
+            "schema": OfferLetterData.model_json_schema(),
         },
     }
 
@@ -68,6 +82,71 @@ def convert_pdf_to_images(pdf_bytes: bytes) -> List[bytes]:
 
     images = convert_from_bytes(pdf_bytes)
     return [pil_to_bytes(img) for img in images]
+
+
+def render_pdf_to_images(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
+    """Render each page of a PDF to high-quality JPEG bytes using PyMuPDF."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    images = []
+
+    for page in doc:
+        # Increase resolution with zoom matrix
+        zoom = dpi / 72  # 72 is the default PDF DPI
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("jpeg")
+        images.append(img_bytes)
+
+    doc.close()
+    return images
+
+
+def preprocess_image(image_bytes: bytes) -> bytes:
+    """Apply denoising and deskewing to image bytes using OpenCV."""
+    try:
+        # Convert bytes to numpy array
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            return image_bytes
+
+        # 1. Denoising
+        # Reduce noise while preserving edges
+        img = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+
+        # 2. Deskewing
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Threshold to get black text on white background
+        gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+        # Find all points where pixels are non-zero (text)
+        coords = np.column_stack(np.where(gray > 0))
+        # Get the minimum area rotated rectangle that contains all points
+        angle = cv2.minAreaRect(coords)[-1]
+
+        # The angle returned by minAreaRect is in the range [-90, 0)
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+
+        # If the angle is significant, rotate
+        if abs(angle) > 0.5:
+            (h, w) = img.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            img = cv2.warpAffine(
+                img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+            )
+
+        # Encode back to bytes
+        _, encoded_img = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        return encoded_img.tobytes()
+
+    except Exception as e:
+        print(f"Error during image pre-processing: {e}")
+        return image_bytes
 
 
 def extract_text_and_images_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, List[bytes]]]:
