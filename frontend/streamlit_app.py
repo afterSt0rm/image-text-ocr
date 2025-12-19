@@ -39,12 +39,12 @@ def create_new_chat(uploaded_file):
 with st.sidebar:
     st.header("Configuration")
     api_base_url = st.text_input("API Base URL", value="http://localhost:8000")
-    
+
     # Document Type Selector
     st.session_state.doc_type = st.selectbox(
         "Document Type",
         options=list(DOCUMENT_TYPES.keys()),
-        help="Select the type of document for specialized processing"
+        help="Select the type of document for specialized processing",
     )
 
     if st.button("Check Health"):
@@ -123,14 +123,14 @@ if (
                             current_chat["image"].type,
                         )
                     }
-                    
+
                     # Determine endpoint based on document type
                     doc_type = current_chat.get("doc_type", "Auto Detect")
                     doc_type_key = DOCUMENT_TYPES.get(doc_type, "auto")
-                    
+
                     if doc_type_key == "national_id":
                         endpoint = f"{api_base_url}/ocr/national_id"
-                        data = {}  # No prompt needed for structured output
+                        data = {"prompt": prompt}
                     elif doc_type_key == "pdf":
                         endpoint = f"{api_base_url}/ocr/pdf"
                         data = {"prompt": prompt}
@@ -148,39 +148,38 @@ if (
 
                     if response.status_code == 200:
                         result = response.json()
-                        
+
                         # Handle different response formats
                         if doc_type_key == "national_id":
                             # Structured output - display as JSON
                             response_data = result.get("data", {})
                             st.json(response_data)
-                            current_chat["messages"].append({
-                                "role": "assistant",
-                                "content": response_data,
-                                "is_json": True
-                            })
+                            current_chat["messages"].append(
+                                {
+                                    "role": "assistant",
+                                    "content": response_data,
+                                    "is_json": True,
+                                }
+                            )
                         else:
                             response_text = result.get("response", "No response text.")
                             st.markdown(response_text)
-                            current_chat["messages"].append({
-                                "role": "assistant",
-                                "content": response_text
-                            })
+                            current_chat["messages"].append(
+                                {"role": "assistant", "content": response_text}
+                            )
                     else:
                         error_msg = f"Error {response.status_code}: {response.text}"
                         st.error(error_msg)
-                        current_chat["messages"].append({
-                            "role": "assistant",
-                            "content": error_msg
-                        })
+                        current_chat["messages"].append(
+                            {"role": "assistant", "content": error_msg}
+                        )
 
                 except Exception as e:
                     error_msg = f"Failed to connect: {e}"
                     st.error(error_msg)
-                    current_chat["messages"].append({
-                        "role": "assistant",
-                        "content": error_msg
-                    })
+                    current_chat["messages"].append(
+                        {"role": "assistant", "content": error_msg}
+                    )
 
 elif not uploaded_file:
     st.info("Upload an image to start a conversation.")
