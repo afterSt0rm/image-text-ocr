@@ -76,3 +76,27 @@ class NationalIDResponse(BaseModel):
 
     filename: str
     data: NationalIDData
+
+
+class OfferLetterData(BaseModel):
+    """Structured data extracted from an offer letter."""
+
+    course_name: str = Field(..., description="Name of the course/program")
+    remit_amount: float = Field(..., description="Amount to be remitted/paid")
+    remit_currency: str = Field(..., description="Currency of the remit amount")
+    student_name: str = Field(..., description="Name of the student")
+    beneficiary_name: str = Field(
+        ..., description="Name of the university or college (beneficiary)"
+    )
+    iban: Optional[str] = Field(None, description="IBAN code for the payment")
+    swift: Optional[str] = Field(None, description="SWIFT code for the payment")
+    university_address: str = Field(
+        ..., description="Full address of the university/beneficiary"
+    )
+
+
+class OfferLetterResponse(BaseModel):
+    """Response model for offer letter extraction endpoint."""
+
+    filename: str
+    data: OfferLetterData
