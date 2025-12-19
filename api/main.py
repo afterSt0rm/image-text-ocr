@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -9,11 +10,16 @@ from api.models import (
     NationalIDResponse,
     OCRRequest,
     OCRResponse,
+    OfferLetterData,
+    OfferLetterResponse,
 )
 from api.utils import (
     bytes_to_base64,
     extract_text_and_images_from_pdf,
     get_national_id_json_schema,
+    get_offer_letter_json_schema,
+    preprocess_image,
+    render_pdf_to_images,
     send_chat_completion_request,
 )
 
@@ -22,6 +28,7 @@ app = FastAPI(title="OCR API", description="API for OCR processing of images and
 
 # Auto-generated JSON Schema for structured output
 NATIONAL_ID_JSON_SCHEMA = get_national_id_json_schema()
+OFFER_LETTER_JSON_SCHEMA = get_offer_letter_json_schema()
 
 
 # Helper function to save output
@@ -178,8 +185,6 @@ CRITICAL: All dates must be converted to YYYY-MM-DD format regardless of how the
         )
 
         # Parse and validate response
-        import json
-
         data = json.loads(response_text)
         validated_data = NationalIDData(**data)
 
@@ -187,6 +192,82 @@ CRITICAL: All dates must be converted to YYYY-MM-DD format regardless of how the
         save_output(response_text, prefix="national_id")
 
         return NationalIDResponse(
+            filename=file.filename,
+            data=validated_data,
+        )
+
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to parse structured output: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ocr/offer_letter", response_model=OfferLetterResponse)
+async def ocr_offer_letter_endpoint(
+    file: UploadFile = File(...),
+    prompt: str = Form("Extract structured information from this offer letter. "),
+):
+    """
+    OCR endpoint for Offer Letters with multi-page support and pre-processing.
+    Returns validated JSON matching OfferLetterData schema.
+    """
+    try:
+        if file.content_type != "application/pdf":
+            raise HTTPException(
+                status_code=400, detail="This endpoint only accepts PDF files"
+            )
+
+        contents = await file.read()
+
+        # 1. Render PDF pages to images
+        page_images = render_pdf_to_images(contents)
+
+        if not page_images:
+            raise HTTPException(
+                status_code=400, detail="Could not extract images from PDF"
+            )
+
+        # 2. Pre-process and convert to base64
+        images_base64 = []
+        for img_bytes in page_images:
+            # Apply OpenCV pre-processing (denoising, deskewing)
+            preprocessed = preprocess_image(img_bytes)
+            # Convert to base64 for VLM
+            images_base64.append(bytes_to_base64(preprocessed, max_size=1024))
+
+        system_prompt = """You are an OCR assistant specialized in extracting payment and enrollment details from University Offer Letters.
+Analyze all provided pages of the document.
+Extract the relevant fields and return ONLY valid JSON matching the required schema.
+Do not include any explanations or additional text outside the JSON object.
+
+CRITICAL:
+- 'remit_amount' should be a numeric float.
+- 'course_name' should include the full title.
+- 'beneficiary_name' is the University or College to which payment is made.
+- 'iban' (International Bank Account Number): Usually starts with 2 letters (country code), followed by 2 digits, and then a long alphanumeric string (15-34 chars).
+- 'swift' (or BIC): An 8 or 11 character alphanumeric code (mostly letters).
+- Provide both 'iban' and 'swift' if present. If only one is found, provide it. If neither is present, return null.
+- CRITICAL: Do not hallucinate. Only provide IBAN or SWIFT if mentioned in the text or images. Do not mistake phone numbers (e.g., +44...) or reference numbers for IBAN or SWIFT.
+- 'university_address' should be the full mailing address found on the document."""
+
+        # Send request with multi-image contexts
+        response_text = await send_chat_completion_request(
+            prompt,
+            images_base64=images_base64,
+            system_prompt=system_prompt,
+            response_format=OFFER_LETTER_JSON_SCHEMA,
+        )
+
+        # Parse and validate response
+        data = json.loads(response_text)
+        validated_data = OfferLetterData(**data)
+
+        # Save output
+        save_output(response_text, prefix="offer_letter")
+
+        return OfferLetterResponse(
             filename=file.filename,
             data=validated_data,
         )
