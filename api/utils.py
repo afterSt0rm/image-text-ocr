@@ -3,8 +3,8 @@ import io
 import os
 from typing import List, Tuple
 
-import fitz  # PyMuPDF
 import cv2
+import fitz  # PyMuPDF
 import numpy as np
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -16,8 +16,8 @@ load_dotenv()
 
 # OpenAI client configuration
 client = AsyncOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY", "sk-no-key-required"),
-    base_url=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8081/v1"),
+    api_key=os.getenv("API_KEY", "no-key-required"),
+    base_url=os.getenv("BASE_URL", "http://127.0.0.1:8081/v1"),
 )
 
 
@@ -57,7 +57,7 @@ def bytes_to_base64(image_bytes: bytes, max_size: int = 1024) -> str:
         # Convert to JPEG bytes
         with io.BytesIO() as buffer:
             image = image.convert("RGB")  # Ensure RGB for JPEG
-            image.save(buffer, format="JPEG", quality=75)
+            image.save(buffer, format="JPEG", quality=90)
             resized_bytes = buffer.getvalue()
 
         return (
