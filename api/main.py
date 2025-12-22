@@ -67,7 +67,7 @@ async def ocr_image_endpoint(
         contents = await file.read()
 
         # Convert to base64
-        image_base64 = bytes_to_base64(contents, max_size=1024)
+        image_base64 = bytes_to_base64(contents, max_size=2048)
 
         # Send request to VLM
         response_text = await send_chat_completion_request(
@@ -204,6 +204,62 @@ CRITICAL: All dates must be converted to YYYY-MM-DD format regardless of how the
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/ocr/scanned_pdf", response_model=OCRResponse)
+async def ocr_scanned_pdf_endpoint(
+    request_data: OCRRequest = Depends(OCRRequest.as_form_image),
+    file: UploadFile = File(...),
+):
+    """
+    OCR endpoint for scanned PDFs (PDFs containing only images).
+    Renders all pages as images, pre-processes them, and returns full transcription.
+    """
+    try:
+        if file.content_type != "application/pdf":
+            raise HTTPException(
+                status_code=400, detail="This endpoint only accepts PDF files"
+            )
+
+        contents = await file.read()
+
+        # 1. Render PDF pages to images
+        page_images = render_pdf_to_images(contents)
+
+        if not page_images:
+            raise HTTPException(
+                status_code=400, detail="Could not extract images from PDF"
+            )
+
+        response_texts = []
+
+        # 2. Process each page
+        for i, img_bytes in enumerate(page_images):
+            # Apply OpenCV pre-processing (denoising, deskewing)
+            # preprocessed = preprocess_image(img_bytes)
+            # Convert to base64
+            image_base64 = bytes_to_base64(img_bytes, max_size=1024)
+
+            # Send request for this page
+            page_response = await send_chat_completion_request(
+                f"Transcribe Page {i + 1} accurately in Markdown.",
+                images_base64=[image_base64],
+                system_prompt=request_data.system_prompt,
+            )
+            response_texts.append(f"--- Page {i + 1} ---\n{page_response}")
+
+        final_response = "\n\n".join(response_texts)
+        save_output(final_response, prefix="scanned_pdf")
+
+        return OCRResponse(
+            filename=file.filename,
+            prompt=request_data.prompt,
+            system_prompt=request_data.system_prompt,
+            response=final_response,
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ocr/offer_letter", response_model=OfferLetterResponse)
 async def ocr_offer_letter_endpoint(
     file: UploadFile = File(...),
@@ -233,9 +289,9 @@ async def ocr_offer_letter_endpoint(
         images_base64 = []
         for img_bytes in page_images:
             # Apply OpenCV pre-processing (denoising, deskewing)
-            preprocessed = preprocess_image(img_bytes)
+            # preprocessed = preprocess_image(img_bytes)
             # Convert to base64 for VLM
-            images_base64.append(bytes_to_base64(preprocessed, max_size=1024))
+            images_base64.append(bytes_to_base64(img_bytes, max_size=1024))
 
         system_prompt = """You are an OCR assistant specialized in extracting payment and enrollment details from University Offer Letters.
 Analyze all provided pages of the document.
@@ -243,14 +299,20 @@ Extract the relevant fields and return ONLY valid JSON matching the required sch
 Do not include any explanations or additional text outside the JSON object.
 
 CRITICAL:
-- 'remit_amount' should be a numeric float.
-- 'course_name' should include the full title.
+- 'remit_amount' is either the amount that is already remitted/paid if present or the amount that is to be remitted/paid if not paid already and should be a numeric float.
+- `remit_currency` should be the currency of the remit amount. Double check to make sure it is a valid currency code.
+- 'total_tuition_amount' is the grand total amount to be paid for the course present in the document (must include the remit amount, admission fee, and other non-refundable fees if present) and should be a numeric float.
+- 'student_name' is the name of the student and should be a string.
+- 'course_name' should include the full title of the course.
 - 'beneficiary_name' is the University or College to which payment is made.
 - 'iban' (International Bank Account Number): Usually starts with 2 letters (country code), followed by 2 digits, and then a long alphanumeric string (15-34 chars).
-- 'swift' (or BIC): An 8 or 11 character alphanumeric code (mostly letters).
-- Provide both 'iban' and 'swift' if present. If only one is found, provide it. If neither is present, return null.
-- CRITICAL: Do not hallucinate. Only provide IBAN or SWIFT if mentioned in the text or images. Do not mistake phone numbers (e.g., +44...) or reference numbers for IBAN or SWIFT.
-- 'university_address' should be the full mailing address found on the document."""
+- 'swift': An 8 or 11 character alphanumeric code (mostly letters). Also known as BIC.
+- 'bsb': A BSB (Bank State Branch) number MUST be exactly a six-digit code (formatted as XXXXXX or XXX-XXX) applicable for Australian banks. Do not hallucinate.
+- 'payment_purpose': The purpose for the payment of the remit amount by the student. There can be multiple purposes mentioned in the text or images, so provide all that are available.
+- Provide 'iban', 'swift', and 'bsb' if present. If multiple are found, provide all that are available.
+- CRITICAL: Do not hallucinate. Only provide 'iban', 'swift', and 'bsb' if they are specifically and clearly mentioned in the text or images. Do not mistake phone numbers (e.g., +44...) or regular account numbers or reference numbers for IBAN or SWIFT.
+- 'university_address' should be the full mailing address of the University or College found on the document and should not be confused with the address of the student.
+"""
 
         # Send request with multi-image contexts
         response_text = await send_chat_completion_request(
