@@ -57,7 +57,7 @@ def bytes_to_base64(image_bytes: bytes, max_size: int = 1024) -> str:
         # Convert to JPEG bytes
         with io.BytesIO() as buffer:
             image = image.convert("RGB")  # Ensure RGB for JPEG
-            image.save(buffer, format="JPEG", quality=90)
+            image.save(buffer, format="JPEG", quality=100)
             resized_bytes = buffer.getvalue()
 
         return (
@@ -91,7 +91,7 @@ def render_pdf_to_images(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
 
     for page in doc:
         # Increase resolution with zoom matrix
-        zoom = dpi / 72  # 72 is the default PDF DPI
+        zoom = dpi / 72
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
         img_bytes = pix.tobytes("jpeg")
@@ -197,6 +197,13 @@ async def send_chat_completion_request(
     images_base64: List[str] = None,
     system_prompt: str = None,
     response_format: dict = None,
+    greedy: str = "false",
+    temperature: float = None,
+    top_p: float = None,
+    top_k: int = None,
+    repetition_penalty: float = None,
+    presence_penalty: float = None,
+    max_tokens: int = None,
 ) -> str:
     """Send an async chat completion request using OpenAI client."""
 
@@ -224,11 +231,44 @@ async def send_chat_completion_request(
         messages.insert(0, {"role": "system", "content": system_prompt})
 
     try:
+        # Default generation parameters for QWen3-VL
+        if images_base64:
+            # For VL
+            greedy = greedy if greedy is not None else "false"
+            temperature = temperature if temperature is not None else 0.2
+            top_p = top_p if top_p is not None else 0.8
+            top_k = top_k if top_k is not None else 20
+            repetition_penalty = (
+                repetition_penalty if repetition_penalty is not None else 1.0
+            )
+            presence_penalty = presence_penalty if presence_penalty is not None else 1.5
+            max_tokens = max_tokens if max_tokens is not None else 16384
+        else:
+            # For Text
+            greedy = greedy if greedy is not None else "false"
+            temperature = temperature if temperature is not None else 0.1
+            top_p = top_p if top_p is not None else 1.0
+            top_k = top_k if top_k is not None else 40
+            repetition_penalty = (
+                repetition_penalty if repetition_penalty is not None else 1.0
+            )
+            presence_penalty = presence_penalty if presence_penalty is not None else 2.0
+            max_tokens = max_tokens if max_tokens is not None else 32768
+
         # Build request kwargs
         request_kwargs = {
-            "model": "Qwen3-VL-8B-Instruct-GGUF:Q4_K_M",
+            "model": "Qwen3-VL-8B-Thinking-GGUF:Q4_K_M",
             "messages": messages,
             "timeout": 600.0,
+            "temperature": temperature,
+            "top_p": top_p,
+            "presence_penalty": presence_penalty,
+            "max_tokens": max_tokens,
+            "extra_body": {
+                "greedy": greedy,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+            },
         }
 
         # Add response_format if provided (for structured output)
@@ -236,6 +276,7 @@ async def send_chat_completion_request(
             request_kwargs["response_format"] = response_format
 
         response = await client.chat.completions.create(**request_kwargs)
+
         return response.choices[0].message.content
     except Exception as e:
         raise Exception(f"OpenAI API request failed: {str(e)}")
