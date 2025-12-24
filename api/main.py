@@ -1,6 +1,8 @@
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import List
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
@@ -285,49 +287,74 @@ async def ocr_offer_letter_endpoint(
                 status_code=400, detail="Could not extract images from PDF"
             )
 
-        # 2. Pre-process and convert to base64
-        images_base64 = []
-        for img_bytes in page_images:
-            # Apply OpenCV pre-processing (denoising, deskewing)
-            # preprocessed = preprocess_image(img_bytes)
-            # Convert to base64 for VLM
-            images_base64.append(bytes_to_base64(img_bytes, max_size=1024))
-
+        # 2. Map Phase: Extract information from each page in parallel
         system_prompt = """You are an OCR assistant specialized in extracting payment and enrollment details from University Offer Letters.
-Analyze all provided pages of the document.
-Extract the relevant fields and return ONLY valid JSON matching the required schema.
-Do not include any explanations or additional text outside the JSON object.
+Extract ONLY what you can clearly see on this page. Return ONLY valid JSON matching the schema.
 
-CRITICAL:
-- 'remit_amount' is either the amount that is already remitted/paid if present or the amount that is to be remitted/paid if not paid already and should be a numeric float.
-- `remit_currency` should be the currency of the remit amount. Double check to make sure it is a valid currency code.
-- 'total_tuition_amount' is the grand total amount to be paid for the course present in the document (must include the remit amount, admission fee, and other non-refundable fees if present) and should be a numeric float.
-- 'student_name' is the name of the student and should be a string.
-- 'course_name' should include the full title of the course.
-- 'beneficiary_name' is the University or College to which payment is made.
-- 'iban' (International Bank Account Number): Usually starts with 2 letters (country code), followed by 2 digits, and then a long alphanumeric string (15-34 chars).
-- 'swift': An 8 or 11 character alphanumeric code (mostly letters). Also known as BIC.
-- 'bsb': A BSB (Bank State Branch) number MUST be exactly a six-digit code (formatted as XXXXXX or XXX-XXX) applicable for Australian banks. Do not hallucinate.
-- 'payment_purpose': The purpose for the payment of the remit amount by the student. There can be multiple purposes mentioned in the text or images, so provide all that are available.
-- Provide 'iban', 'swift', and 'bsb' if present. If multiple are found, provide all that are available.
-- CRITICAL: Do not hallucinate. Only provide 'iban', 'swift', and 'bsb' if they are specifically and clearly mentioned in the text or images. Do not mistake phone numbers (e.g., +44...) or regular account numbers or reference numbers for IBAN or SWIFT.
-- 'university_address' should be the full mailing address of the University or College found on the document and should not be confused with the address of the student.
-"""
+CRITICAL FIELD DEFINITIONS:
+- 'course_name': The academic program or language course name (e.g., "Japanese Language Course", "B.Sc Computer Science").
+- 'remit_amount': Total amount to be paid/remitted (numeric)
+- 'total_tuition_amount': Grand total for the course (includes remit amount, fees, etc.). Numeric float.
+- 'student_name': Must be the full name of the student including the first name and lastname/surname.
+- 'beneficiary_name': Student's university or college name.
+- 'iban': International Bank Account Number. Starts with 2 letters + 2 digits + long alphanumeric. NOTE: Not used in Australia.
+- 'swift': 8 or 11 char alphanumeric code (BIC). Required for ALL payments.
+- 'bsb': EXACTLY a six-digit code (XXXXXX or XXX-XXX) for Australian banks.
+- 'account_number': Bank account of the University. Required if BSB is present.
+- 'payment_purpose': The purpose or reference for the payment. IMPORTANT: Look for this on the same page as 'remit_amount' or bank details.
+- 'university_address': Full mailing address of the University/College.
 
-        # Send request with multi-image contexts
-        response_text = await send_chat_completion_request(
-            prompt,
-            images_base64=images_base64,
-            system_prompt=system_prompt,
+RULES:
+- For Australian Payments: Expect 'swift' + 'bsb' + 'account_number' (NO IBAN).
+- For International Payments: Expect 'swift' + 'iban'.
+- Return null for fields not visible on THIS page.
+- Do NOT hallucinate. Do not mistake phone numbers for banking details."""
+
+        async def process_page(img_bytes, page_idx):
+            img_b64 = bytes_to_base64(img_bytes, max_size=1024)
+            return await send_chat_completion_request(
+                f"Extract details from Page {page_idx + 1}.",
+                images_base64=[img_b64],
+                system_prompt=system_prompt,
+                response_format=OFFER_LETTER_JSON_SCHEMA,
+            )
+
+        map_results_raw = await asyncio.gather(
+            *[process_page(img, i) for i, img in enumerate(page_images)]
+        )
+
+        # 3. Reduce Phase: Accumulative Consolidation
+        consolidation_prompt = f"""You are a JSON consolidation assistant. I have processed an offer letter page by page.
+Merge the partial extractions into a single, high-precision JSON object.
+
+Partial Extractions:
+{json.dumps(map_results_raw, indent=2)}
+
+REFINEMENT & CONFLICT RESOLUTION RULES:
+1. OFFICIAL UNIVERSITY ADDRESS: For 'university_address', identify the address explicitly associated with the 'beneficiary_name' (the University/College). Strictly prioritize the official institution address found on letterheads or footer sections. DO NOT use the student's address or any other unrelated descriptive text simply because it is longer.
+2. NAME COMPLETENESS: For 'student_name' and 'beneficiary_name', always prioritize the most complete version of the name (e.g., "University of Sydney" over "Sydney Uni", "John Doe" over "John").
+3. BANKING VALIDATION: Strictly enforce the 'Australian vs International' logic.
+   - If a valid 6-digit 'bsb' is found, DISCARD any 'iban' found on other pages (likely hallucinations).
+   - Ensure 'account_number' is only present if 'bsb' is present.
+4. COURSE NAME ACCURACY: Search through all page extractions for a valid academic program name (e.g., "Japanese Language Course") and use that.
+5. PURPOSE PROXIMITY: Prioritize the 'payment_purpose' that was extracted from a page containing the 'remit_amount' or banking details.
+6. CROSS-PAGE ACCUMULATION: If information for a single field is partial across pages, synthesize the pieces into the most accurate full value.
+7. NO HALLUCINATION: If a field is null/missing across all pages, return null.
+
+Return ONLY valid JSON matching the OfferLetterData schema."""
+
+        merge_response = await send_chat_completion_request(
+            "Merge the partial JSON extractions provided in the system prompt based on the Refinement Rules.",
+            system_prompt=consolidation_prompt,
             response_format=OFFER_LETTER_JSON_SCHEMA,
         )
 
         # Parse and validate response
-        data = json.loads(response_text)
+        data = json.loads(merge_response)
         validated_data = OfferLetterData(**data)
 
         # Save output
-        save_output(response_text, prefix="offer_letter")
+        save_output(merge_response, prefix="offer_letter")
 
         return OfferLetterResponse(
             filename=file.filename,
