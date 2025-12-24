@@ -92,6 +92,7 @@ class OfferLetterData(BaseModel):
     payment_purpose: Optional[str] = Field(
         None, description="The purpose or reference for the payment of remit amount"
     )
+    account_number: Optional[str] = Field(None, description="Account number for the payment")
     university_address: str = Field(
         ..., description="Full address of the university/beneficiary"
     )
