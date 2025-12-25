@@ -1,11 +1,16 @@
 import asyncio
 import json
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import List
 
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+
+load_dotenv()
 
 from api.models import (
     NationalIDData,
@@ -22,10 +27,51 @@ from api.utils import (
     get_offer_letter_json_schema,
     preprocess_image,
     render_pdf_to_images,
+    send_bearer_token_request,
     send_chat_completion_request,
 )
 
+# Bearer token API configuration
+API_URL = os.getenv("API_URL", "https://gpu-router.server247.info/route/qwen3-vl")
+BEARER_TOKEN = os.getenv("BEARER_TOKEN", "")
+
 app = FastAPI(title="OCR API", description="API for OCR processing of images and PDFs")
+
+
+def extract_json_from_response(response_text: str) -> dict:
+    """Extract JSON from a response that may contain markdown code blocks or extra text."""
+    # Try direct JSON parsing first
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to extract JSON from markdown code blocks
+    # Match ```json ... ``` or ``` ... ```
+    code_block_pattern = r"```(?:json)?\s*\n?([\s\S]*?)\n?```"
+    matches = re.findall(code_block_pattern, response_text)
+
+    for match in matches:
+        try:
+            return json.loads(match.strip())
+        except json.JSONDecodeError:
+            continue
+
+    # Try to find JSON object pattern { ... }
+    json_pattern = r"\{[\s\S]*\}"
+    matches = re.findall(json_pattern, response_text)
+
+    # Try each match, starting with the longest (most complete)
+    for match in sorted(matches, key=len, reverse=True):
+        try:
+            return json.loads(match)
+        except json.JSONDecodeError:
+            continue
+
+    # If nothing works, raise an error
+    raise json.JSONDecodeError(
+        f"Could not extract valid JSON from response", response_text, 0
+    )
 
 
 # Auto-generated JSON Schema for structured output
@@ -269,12 +315,19 @@ async def ocr_offer_letter_endpoint(
 ):
     """
     OCR endpoint for Offer Letters with multi-page support and pre-processing.
+    Uses Bearer token authentication API for chat completion requests.
     Returns validated JSON matching OfferLetterData schema.
     """
     try:
         if file.content_type != "application/pdf":
             raise HTTPException(
                 status_code=400, detail="This endpoint only accepts PDF files"
+            )
+
+        if not BEARER_TOKEN:
+            raise HTTPException(
+                status_code=500,
+                detail="BEARER_TOKEN environment variable is not configured",
             )
 
         contents = await file.read()
@@ -289,68 +342,149 @@ async def ocr_offer_letter_endpoint(
 
         # 2. Map Phase: Extract information from each page in parallel
         system_prompt = """You are an OCR assistant specialized in extracting payment and enrollment details from University Offer Letters.
-Extract ONLY what you can clearly see on this page. Return ONLY valid JSON matching the schema.
+Extract ONLY what you can clearly see on this page. Return ONLY valid JSON.
 
 CRITICAL FIELD DEFINITIONS:
-- 'course_name': The academic program or language course name (e.g., "Japanese Language Course", "B.Sc Computer Science").
-- 'remit_amount': Total amount to be paid/remitted (numeric)
+- 'course_name': The academic program or language course name (e.g., "Japanese Language Course", "B.Sc Computer Science"). String.
+- 'remit_amount': Total amount to be paid/remitted. Numeric float.
 - 'total_tuition_amount': Grand total for the course (includes remit amount, fees, etc.). Numeric float.
-- 'student_name': Must be the full name of the student including the first name and lastname/surname.
-- 'beneficiary_name': Student's university or college name.
-- 'iban': International Bank Account Number. Starts with 2 letters + 2 digits + long alphanumeric. NOTE: Not used in Australia.
-- 'swift': 8 or 11 char alphanumeric code (BIC). Required for ALL payments.
-- 'bsb': EXACTLY a six-digit code (XXXXXX or XXX-XXX) for Australian banks.
-- 'account_number': Bank account of the University. Required if BSB is present.
-- 'payment_purpose': The purpose or reference for the payment. IMPORTANT: Look for this on the same page as 'remit_amount' or bank details.
-- 'university_address': Full mailing address of the University/College.
+- 'remit_currency': Valid currency code for the payment (e.g., "USD", "AUD", "JPY"). String.
+- 'student_name': Must be the full name of the student including the first name and lastname/surname. String.
+- 'beneficiary_name': Student's university or college name. String.
+- 'iban': International Bank Account Number. Starts with 2 letters + 2 digits + long alphanumeric. NOTE: Not used in Australia. String or null.
+- 'swift': 8 or 11 char alphanumeric code (BIC). Required for ALL payments. String or null.
+- 'bsb': EXACTLY a six-digit code (XXXXXX or XXX-XXX) for Australian banks. String or null.
+- 'account_number': Bank account of the University. Required if BSB is present. String or null.
+- 'payment_purpose': The purpose or reference for the payment. IMPORTANT: Look for this on the same page as 'remit_amount' or bank details. String or null.
+- 'university_address': Full mailing address of the University/College. String.
 
 RULES:
 - For Australian Payments: Expect 'swift' + 'bsb' + 'account_number' (NO IBAN).
 - For International Payments: Expect 'swift' + 'iban'.
 - Return null for fields not visible on THIS page.
-- Do NOT hallucinate. Do not mistake phone numbers for banking details."""
+- Do NOT hallucinate. Do not mistake phone numbers for banking details.
 
-        async def process_page(img_bytes, page_idx):
-            img_b64 = bytes_to_base64(img_bytes, max_size=1024)
-            return await send_chat_completion_request(
-                f"Extract details from Page {page_idx + 1}.",
-                images_base64=[img_b64],
+OUTPUT FORMAT:
+Return ONLY a valid JSON object with these exact keys:
+{
+  "course_name": "string or null",
+  "total_tuition_amount": 0.0,
+  "remit_amount": 0.0,
+  "remit_currency": "string or null",
+  "student_name": "string or null",
+  "beneficiary_name": "string or null",
+  "iban": "string or null",
+  "swift": "string or null",
+  "bsb": "string or null",
+  "payment_purpose": "string or null",
+  "account_number": "string or null",
+  "university_address": "string or null"
+}"""
+
+        async def process_page(img_bytes: bytes, page_idx: int) -> str:
+            return await send_bearer_token_request(
+                api_url=API_URL,
+                bearer_token=BEARER_TOKEN,
+                prompt=f"Extract details from Page {page_idx + 1}. Return ONLY valid JSON.",
                 system_prompt=system_prompt,
-                response_format=OFFER_LETTER_JSON_SCHEMA,
+                image=img_bytes,
+                image_filename=f"page_{page_idx + 1}.jpg",
             )
 
         map_results_raw = await asyncio.gather(
             *[process_page(img, i) for i, img in enumerate(page_images)]
         )
 
-        # 3. Reduce Phase: Accumulative Consolidation
-        consolidation_prompt = f"""You are a JSON consolidation assistant. I have processed an offer letter page by page.
-Merge the partial extractions into a single, high-precision JSON object.
+        # 3. Parse each page result to clean JSON
+        parsed_pages = []
+        for i, raw_result in enumerate(map_results_raw):
+            try:
+                parsed = extract_json_from_response(raw_result)
+                # Remove null/None values to reduce size
+                cleaned = {
+                    k: v for k, v in parsed.items() if v is not None and v != "null"
+                }
+                if cleaned:
+                    parsed_pages.append(cleaned)
+            except Exception:
+                continue  # Skip unparseable pages
 
-Partial Extractions:
-{json.dumps(map_results_raw, indent=2)}
+        if not parsed_pages:
+            raise HTTPException(
+                status_code=500, detail="Could not extract any data from the PDF pages"
+            )
+
+        # 4. Incremental Merge: Merge pages two at a time
+        async def merge_two_extractions(extraction1: dict, extraction2: dict) -> dict:
+            """Merge two JSON extractions into one."""
+            merge_prompt = f"""Merge these two JSON extractions from an offer letter into one combined JSON.
+
+Extraction 1:
+{json.dumps(extraction1)}
+
+Extraction 2:
+{json.dumps(extraction2)}
 
 REFINEMENT & CONFLICT RESOLUTION RULES:
-1. OFFICIAL UNIVERSITY ADDRESS: For 'university_address', identify the address explicitly associated with the 'beneficiary_name' (the University/College). Strictly prioritize the official institution address found on letterheads or footer sections. DO NOT use the student's address or any other unrelated descriptive text simply because it is longer.
+1. OFFICIAL UNIVERSITY ADDRESS: For 'university_address', identify the address explicitly associated with the 'beneficiary_name' (the University/College). DO NOT use the student's address or any other unrelated descriptive text simply because it is longer.
+2. OFFICIAL UNIVERSITY NAME: For 'beneficiary_name', identify the official University/College name the student is going to study. Strictly prioritize the official institution name found on letterheads. DO NOT use the bank's name or any other unrelated company name simply because it is longer
 2. NAME COMPLETENESS: For 'student_name' and 'beneficiary_name', always prioritize the most complete version of the name (e.g., "University of Sydney" over "Sydney Uni", "John Doe" over "John").
 3. BANKING VALIDATION: Strictly enforce the 'Australian vs International' logic.
    - If a valid 6-digit 'bsb' is found, DISCARD any 'iban' found on other pages (likely hallucinations).
    - Ensure 'account_number' is only present if 'bsb' is present.
 4. COURSE NAME ACCURACY: Search through all page extractions for a valid academic program name (e.g., "Japanese Language Course") and use that.
-5. PURPOSE PROXIMITY: Prioritize the 'payment_purpose' that was extracted from a page containing the 'remit_amount' or banking details.
+5. PURPOSE PROXIMITY: Prioritize the 'payment_purpose' that was extracted from a page containing the 'remit_amount' or banking details (for example, tutition fee payment, admission fee deposit, living expenses, etc).
 6. CROSS-PAGE ACCUMULATION: If information for a single field is partial across pages, synthesize the pieces into the most accurate full value.
-7. NO HALLUCINATION: If a field is null/missing across all pages, return null.
+7. PAYMENT VALIDATION
+    - 'remit_amount': Total amount to be paid/remitted. Numeric float. In most cases remit amount is lower than total tuition amount.
+    - 'total_tuition_amount': Grand total for the course (includes remit amount, fees, etc.). Numeric float
+9. NO HALLUCINATION: If a field is null/missing across all pages, use an null for required string fields and 0.0 for required numeric fields.
 
-Return ONLY valid JSON matching the OfferLetterData schema."""
+Return ONLY valid JSON with keys: course_name, total_tuition_amount, remit_amount, remit_currency, student_name, beneficiary_name, iban, swift, bsb, payment_purpose, account_number, university_address."""
 
-        merge_response = await send_chat_completion_request(
-            "Merge the partial JSON extractions provided in the system prompt based on the Refinement Rules.",
-            system_prompt=consolidation_prompt,
-            response_format=OFFER_LETTER_JSON_SCHEMA,
-        )
+            response = await send_bearer_token_request(
+                api_url=API_URL,
+                bearer_token=BEARER_TOKEN,
+                prompt="Merge these two extractions. Return ONLY valid JSON.",
+                system_prompt=merge_prompt,
+            )
+            return extract_json_from_response(response)
+
+        # If only one page, use it directly
+        if len(parsed_pages) == 1:
+            merged_result = parsed_pages[0]
+        else:
+            # Incrementally merge: start with first, merge with each subsequent
+            merged_result = parsed_pages[0]
+            for i in range(1, len(parsed_pages)):
+                merged_result = await merge_two_extractions(
+                    merged_result, parsed_pages[i]
+                )
+
+        # Ensure all required fields exist with defaults
+        default_values = {
+            "course_name": "",
+            "total_tuition_amount": 0.0,
+            "remit_amount": 0.0,
+            "remit_currency": "",
+            "student_name": "",
+            "beneficiary_name": "",
+            "iban": None,
+            "swift": None,
+            "bsb": None,
+            "payment_purpose": None,
+            "account_number": None,
+            "university_address": "",
+        }
+        for key, default in default_values.items():
+            if key not in merged_result or merged_result[key] is None:
+                if default is not None:  # Only set default for required fields
+                    merged_result[key] = default
+
+        merge_response = json.dumps(merged_result)
 
         # Parse and validate response
-        data = json.loads(merge_response)
+        data = extract_json_from_response(merge_response)
         validated_data = OfferLetterData(**data)
 
         # Save output
